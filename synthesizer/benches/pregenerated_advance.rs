@@ -14,12 +14,15 @@
 // limitations under the License.
 
 //! Times `prepare_advance_to_next_quorum_block`, `check_next_block`, and `advance_to_next_block`
-//! against pregenerated `transfer_public` executions.
+//! against one full block of pregenerated `transfer_public` executions.
+//!
+//! A full block is `BatchHeader::MAX_TRANSMISSIONS_PER_BATCH * PREGENERATED_NUM_VALIDATORS`
+//! transmissions (default 4 validators).
 //!
 //! Load executions from `PREGENERATED_TX_DIR` (default `./transaction_files`). Each
 //! `executions-*.txt` file is one transaction string per line.
 //!
-//! `PREGENERATED_TX_LIMIT` caps how many executions to load (`0` means all).
+//! `PREGENERATED_TX_LIMIT` can load fewer executions (`0` means one full block).
 
 use std::{
     collections::HashSet,
@@ -53,11 +56,17 @@ fn print_bencher(name: &str, elapsed: Duration) {
     println!("test {name} ... bench: {} ns/iter (+/- 0)", elapsed.as_nanos());
 }
 
-fn visit_execution_files(dir: &Path, lines: &mut Vec<String>) -> Result<()> {
+fn visit_execution_files(dir: &Path, lines: &mut Vec<String>, limit: usize) -> Result<()> {
+    if lines.len() >= limit {
+        return Ok(());
+    }
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let path = entry?.path();
         if path.is_dir() {
-            visit_execution_files(&path, lines)?;
+            visit_execution_files(&path, lines, limit)?;
+            if lines.len() >= limit {
+                return Ok(());
+            }
             continue;
         }
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -66,6 +75,9 @@ fn visit_execution_files(dir: &Path, lines: &mut Vec<String>) -> Result<()> {
         }
         let content = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         for line in content.lines() {
+            if lines.len() >= limit {
+                return Ok(());
+            }
             let line = line.trim();
             if !line.is_empty() {
                 lines.push(line.to_string());
@@ -76,12 +88,11 @@ fn visit_execution_files(dir: &Path, lines: &mut Vec<String>) -> Result<()> {
 }
 
 fn load_executions(dir: &Path, limit: usize) -> Result<Vec<Transaction<CurrentNetwork>>> {
+    ensure!(limit > 0, "execution limit must be positive");
     let mut lines = Vec::new();
-    visit_execution_files(dir, &mut lines)?;
+    visit_execution_files(dir, &mut lines, limit)?;
     ensure!(!lines.is_empty(), "no executions-*.txt files under {}", dir.display());
-    if limit > 0 {
-        lines.truncate(limit);
-    }
+    lines.truncate(limit);
 
     let mut txs = Vec::with_capacity(lines.len());
     for (i, line) in lines.iter().enumerate() {
@@ -116,11 +127,13 @@ fn fund_payers(builder: &TestChainBuilder<CurrentNetwork>, txs: &[Transaction<Cu
 fn main() {
     let tx_dir =
         env::var("PREGENERATED_TX_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("transaction_files"));
-    let tx_limit = env::var("PREGENERATED_TX_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(0usize);
     let num_validators = env::var("PREGENERATED_NUM_VALIDATORS").ok().and_then(|s| s.parse().ok()).unwrap_or(4usize);
+    let chunk_size = BatchHeader::<CurrentNetwork>::MAX_TRANSMISSIONS_PER_BATCH.saturating_mul(num_validators).max(1);
+    let tx_limit = env::var("PREGENERATED_TX_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(0usize);
+    let load_limit = if tx_limit == 0 { chunk_size } else { tx_limit.min(chunk_size) };
 
-    println!("Loading executions from {} (limit={tx_limit})", tx_dir.display());
-    let txs = load_executions(&tx_dir, tx_limit).pretty_expect("Failed to load pregenerated executions");
+    println!("Loading executions from {} (limit={load_limit}, full block={chunk_size})", tx_dir.display());
+    let txs = load_executions(&tx_dir, load_limit).pretty_expect("Failed to load pregenerated executions");
     println!("Loaded {} executions", txs.len());
 
     let rng = &mut TestRng::default();
@@ -138,42 +151,32 @@ fn main() {
 
     fund_payers(&builder, &txs).pretty_expect("Failed to fund execution fee payers");
 
-    let chunk_size = BatchHeader::<CurrentNetwork>::MAX_TRANSMISSIONS_PER_BATCH.saturating_mul(num_validators).max(1);
-    let mut prepare_total = Duration::ZERO;
-    let mut check_total = Duration::ZERO;
-    let mut advance_total = Duration::ZERO;
-    let mut accepted = 0usize;
-    let mut blocks = 0usize;
+    let loaded = txs.len();
+    let (subdag, transmissions, leader_certificate) = builder
+        .build_quorum_subdag_and_transmissions_for_next_block(
+            GenerateBlockOptions { transactions: txs, ..Default::default() },
+            rng,
+        )
+        .pretty_expect("Failed to build the quorum subdag");
 
-    for chunk in txs.chunks(chunk_size) {
-        let (subdag, transmissions, leader_certificate) = builder
-            .build_quorum_subdag_and_transmissions_for_next_block(
-                GenerateBlockOptions { transactions: chunk.to_vec(), ..Default::default() },
-                rng,
-            )
-            .pretty_expect("Failed to build the quorum subdag");
+    let start = Instant::now();
+    let block = builder
+        .ledger()
+        .prepare_advance_to_next_quorum_block(subdag, transmissions, rng)
+        .unwrap_or_else(|err| panic!("prepare_advance_to_next_quorum_block failed: {err}"));
+    let prepare_total = start.elapsed();
 
-        let start = Instant::now();
-        let block = builder
-            .ledger()
-            .prepare_advance_to_next_quorum_block(subdag, transmissions, rng)
-            .unwrap_or_else(|err| panic!("prepare_advance_to_next_quorum_block failed: {err}"));
-        prepare_total += start.elapsed();
+    let start = Instant::now();
+    builder.ledger().check_next_block(&block, rng).unwrap_or_else(|err| panic!("check_next_block failed: {err}"));
+    let check_total = start.elapsed();
 
-        let start = Instant::now();
-        builder.ledger().check_next_block(&block, rng).unwrap_or_else(|err| panic!("check_next_block failed: {err}"));
-        check_total += start.elapsed();
+    let start = Instant::now();
+    builder.apply_prepared_quorum_block(&block, leader_certificate).pretty_expect("advance_to_next_block failed");
+    let advance_total = start.elapsed();
 
-        let start = Instant::now();
-        builder.apply_prepared_quorum_block(&block, leader_certificate).pretty_expect("advance_to_next_block failed");
-        advance_total += start.elapsed();
-
-        accepted += block.transactions().num_accepted();
-        blocks += 1;
-    }
-
-    ensure_accepted(accepted, txs.len());
-    println!("Processed {blocks} block(s); accepted {accepted} of {} executions", txs.len());
+    let accepted = block.transactions().num_accepted();
+    ensure_accepted(accepted, loaded);
+    println!("Processed 1 block; accepted {accepted} of {loaded} executions");
     print_bencher("pregenerated/prepare_advance_to_next_quorum_block", prepare_total);
     print_bencher("pregenerated/check_next_block", check_total);
     print_bencher("pregenerated/advance_to_next_block", advance_total);

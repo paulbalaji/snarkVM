@@ -158,7 +158,6 @@ jobs:
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
       PREGENERATED_TX_DIR: ${{ github.workspace }}/transaction_files
-      PREGENERATED_TX_LIMIT: "0"
       GCLOUD_SERVICE_KEY: ${{ secrets.GCLOUD_SERVICE_KEY }}
     steps:
       - name: Checkout
