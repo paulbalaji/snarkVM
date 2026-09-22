@@ -15,6 +15,7 @@
 
 use super::*;
 
+use snarkvm_ledger_block::RejectedReason;
 use snarkvm_ledger_committee::{MAX_DELEGATORS, MIN_DELEGATOR_STAKE, MIN_VALIDATOR_SELF_STAKE};
 use snarkvm_ledger_puzzle::SolutionID;
 #[cfg(feature = "history-staking-rewards")]
@@ -31,7 +32,7 @@ use snarkvm_utilities::{cfg_sort_by_cached_key, defer, dev_eprintln};
 use crate::Stack;
 #[cfg(feature = "metrics")]
 use std::time::Instant;
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 /// Uniqueness tracking accumulated while assembling a candidate block's transactions.
 struct CandidateTransactionDetails<N: Network> {
@@ -512,10 +513,23 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         solutions: &Solutions<N>,
         transactions: &Transactions<N>,
     ) -> Result<Vec<FinalizeOperation<N>>> {
+        // Performs a **real-run** of finalize over the list of ratifications, solutions, and transactions.
+        self.finalize_with_rejected_reasons(state, ratifications, solutions, transactions, self.take_rejected_reasons())
+    }
+
+    /// Real-run finalize, inserting `rejected_reasons` for rejected transactions in this block.
+    pub(crate) fn finalize_with_rejected_reasons(
+        &self,
+        state: FinalizeGlobalState,
+        ratifications: &Ratifications<N>,
+        solutions: &Solutions<N>,
+        transactions: &Transactions<N>,
+        rejected_reasons: HashMap<N::TransactionID, RejectedReason<N>>,
+    ) -> Result<Vec<FinalizeOperation<N>>> {
         let timer = timer!("VM::finalize");
 
-        // Performs a **real-run** of finalize over the list of ratifications, solutions, and transactions.
-        let ratified_finalize_operations = self.atomic_finalize(state, ratifications, solutions, transactions)?;
+        let ratified_finalize_operations =
+            self.atomic_finalize(state, ratifications, solutions, transactions, rejected_reasons)?;
 
         finish!(timer, "Finished real-run of finalize");
         Ok(ratified_finalize_operations)
@@ -625,16 +639,6 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         // Determine the maximum number of aborted transactions allowed in a block.
         let max_aborted_transactions = Transactions::<N>::max_aborted_transactions();
 
-        // Clear out any pending rejection reasons in case of errors in the previous iteration.
-        {
-            let mut rejected_reasons = self.pending_rejected_reasons.write();
-            if !rejected_reasons.is_empty() {
-                // This may be emitted once during shutdown.
-                warn!("There are pending rejection reasons, clearing them up: {:?}", &*rejected_reasons);
-            }
-            rejected_reasons.clear();
-        }
-
         // Update the block height used for the purposes of historical mapping accounting.
         #[cfg(feature = "history")]
         self.store
@@ -648,6 +652,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         }
         self.finalize_store().start_atomic();
         let parked_cell: RefCell<Option<IndexMap<ProgramID<N>, Arc<Stack<N>>>>> = RefCell::new(None);
+        let rejected_reasons: RefCell<HashMap<N::TransactionID, RejectedReason<N>>> = RefCell::new(HashMap::new());
         let result = (|| -> Result<_, String> {
             // Ensure the number of solutions does not exceed the maximum.
             if num_solutions > max_aborted_solutions {
@@ -795,8 +800,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                                         ConfirmedTransaction::rejected_deploy(counter, fee_tx, rejected, finalize)
                                             .and_then(|confirmed_tx| {
                                                 // Store the rejection reason.
-                                                self.pending_rejected_reasons
-                                                    .write()
+                                                rejected_reasons
+                                                    .borrow_mut()
                                                     .insert(confirmed_tx.id(), rejected_reason.clone());
                                                 store
                                                     .insert_rejected_reason(*confirmed_tx.id(), rejected_reason)
@@ -889,8 +894,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                                                 )
                                                 .and_then(|confirmed_tx| {
                                                     // Store the rejection reason.
-                                                    self.pending_rejected_reasons
-                                                        .write()
+                                                    rejected_reasons
+                                                        .borrow_mut()
                                                         .insert(confirmed_tx.id(), rejected_reason.clone());
                                                     store
                                                         .insert_rejected_reason(*confirmed_tx.id(), rejected_reason)
@@ -1031,13 +1036,21 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         match result {
             Ok((ratifications, confirmed, aborted, ratified_finalize_operations)) => {
                 let parked = parked_cell.into_inner().unwrap_or_default();
+                let rejected_reasons = rejected_reasons.into_inner();
                 if let Some(id) = keep {
-                    self.store_self_constructed(ratified_finalize_operations.clone(), parked, id, true);
+                    self.store_self_constructed(
+                        ratified_finalize_operations.clone(),
+                        parked,
+                        rejected_reasons,
+                        id,
+                        true,
+                    );
                 } else {
                     self.finalize_store().abort_atomic();
                     self.store_self_constructed(
                         ratified_finalize_operations.clone(),
                         IndexMap::new(),
+                        rejected_reasons,
                         self.allocate_speculation_id(),
                         false,
                     );
@@ -1061,6 +1074,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         ratifications: &Ratifications<N>,
         solutions: &Solutions<N>,
         transactions: &Transactions<N>,
+        mut rejected_reasons: HashMap<N::TransactionID, RejectedReason<N>>,
     ) -> Result<Vec<FinalizeOperation<N>>> {
         // The tests may run this method ad-hoc, outside of the context of add_next_block.
         #[cfg(not(test))]
@@ -1218,7 +1232,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                                     ));
                                 }
 
-                                if let Some(rejected_reason) = self.pending_rejected_reasons.write().remove(fee_tx_id) {
+                                if let Some(rejected_reason) = rejected_reasons.remove(fee_tx_id) {
                                     store.insert_rejected_reason(**fee_tx_id, rejected_reason.clone()).map_err(
                                         |_| "Couldn't store the reason behind a rejected deployment".to_string(),
                                     )?;
@@ -1263,7 +1277,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                                     ));
                                 }
 
-                                if let Some(rejected_reason) = self.pending_rejected_reasons.write().remove(fee_tx_id) {
+                                if let Some(rejected_reason) = rejected_reasons.remove(fee_tx_id) {
                                     store.insert_rejected_reason(**fee_tx_id, rejected_reason.clone()).map_err(
                                         |_| "Couldn't store the reason behind a rejected execute".to_string(),
                                     )?;
@@ -1309,6 +1323,10 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             process.commit_stacks();
 
             finish!(timer); // <- Note: This timer does **not** include the time to write batch to DB.
+
+            if !rejected_reasons.is_empty() {
+                warn!("There are pending rejection reasons, clearing them up: {:?}", rejected_reasons);
+            }
 
             Ok(ratified_finalize_operations)
         });

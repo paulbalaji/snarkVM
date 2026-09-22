@@ -58,7 +58,6 @@ use snarkvm_ledger_block::{
     Ratifications,
     Ratify,
     Rejected,
-    RejectedReason,
     Solutions,
     Transaction,
     Transactions,
@@ -135,9 +134,6 @@ pub struct VM<N: Network, C: ConsensusStorage<N>> {
     partially_verified_transactions: Arc<RwLock<LruCache<TransactionCacheKey<N>, N::TransmissionChecksum>>>,
     /// The restrictions list.
     restrictions: Restrictions<N>,
-    /// The list of rejection reasons for pending confirmed transactions.
-    /// TODO: it would be cleaner if these are passed along as an argument to `add_next_block`, but this requires a bigger refactor.
-    pending_rejected_reasons: Arc<RwLock<HashMap<N::TransactionID, RejectedReason<N>>>>,
     /// A sender to the channel for operations that must be performed sequentially.
     sequential_ops_tx: Arc<RwLock<Option<mpsc::Sender<SequentialOperationRequest<N>>>>>,
     /// The handle to the thread which processes operations sequentially.
@@ -244,7 +240,6 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             ))),
             restrictions: Restrictions::load()?,
             sequential_ops_tx: Default::default(),
-            pending_rejected_reasons: Default::default(),
             sequential_ops_thread: Default::default(),
             self_constructed: Default::default(),
             next_speculation_id: Default::default(),
@@ -641,6 +636,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         // instead of pausing and replaying RealRun.
         let kept = self.take_kept_matching(block.hash());
         let using_kept_batch = kept.is_some();
+        let rejected_reasons = if using_kept_batch { HashMap::new() } else { self.take_rejected_reasons() };
         let mut kept_guard = using_kept_batch.then(|| {
             Defer::new(|| {
                 if self.finalize_store().is_atomic_in_progress() {
@@ -683,7 +679,13 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             })();
             finish.map(|_| Vec::new())
         } else {
-            self.finalize(state, block.ratifications(), block.solutions(), block.transactions())
+            self.finalize_with_rejected_reasons(
+                state,
+                block.ratifications(),
+                block.solutions(),
+                block.transactions(),
+                rejected_reasons,
+            )
         };
 
         match finalize_result {

@@ -15,9 +15,11 @@
 
 use crate::{Stack, vm::*};
 use console::network::prelude::Network;
+use snarkvm_ledger_block::RejectedReason;
 
 use indexmap::IndexMap;
 use std::{
+    collections::HashMap,
     fmt,
     sync::{Arc, atomic::Ordering},
     thread,
@@ -39,6 +41,8 @@ pub(crate) struct SelfConstructed<N: Network> {
     pub finalize_operations: Vec<FinalizeOperation<N>>,
     /// Staged stacks parked off `Process` so the mempool does not observe uncommitted programs.
     pub parked_stacks: IndexMap<ProgramID<N>, Arc<Stack<N>>>,
+    /// Rejection reasons recorded by this speculate. RealRun inserts any that are still pending.
+    pub rejected_reasons: HashMap<N::TransactionID, RejectedReason<N>>,
     /// When `true`, the finalize-store atomic batch is still open and must be finished or aborted.
     pub batch_kept: bool,
 }
@@ -167,11 +171,21 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         &self,
         finalize_operations: Vec<FinalizeOperation<N>>,
         parked_stacks: IndexMap<ProgramID<N>, Arc<Stack<N>>>,
+        rejected_reasons: HashMap<N::TransactionID, RejectedReason<N>>,
         id: SpeculationId,
         batch_kept: bool,
     ) {
         *self.self_constructed.lock() =
-            Some(SelfConstructed { id, hash: None, finalize_operations, parked_stacks, batch_kept });
+            Some(SelfConstructed { id, hash: None, finalize_operations, parked_stacks, rejected_reasons, batch_kept });
+    }
+
+    /// Removes rejection reasons from the current speculate entry, leaving the rest in place.
+    pub(crate) fn take_rejected_reasons(&self) -> HashMap<N::TransactionID, RejectedReason<N>> {
+        self.self_constructed
+            .lock()
+            .as_mut()
+            .map(|constructed| std::mem::take(&mut constructed.rejected_reasons))
+            .unwrap_or_default()
     }
 
     /// Associates a constructed block hash with the matching construct-path speculate.
@@ -227,10 +241,13 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
 
     /// Aborts a kept finalize batch. Must run on the sequential operations thread.
     pub(crate) fn discard_kept_speculation_inner(&self) {
-        if let Some(kept) = self.self_constructed.lock().take()
-            && kept.batch_kept
-            && self.finalize_store().is_atomic_in_progress()
-        {
+        let Some(kept) = self.self_constructed.lock().take() else {
+            return;
+        };
+        if !kept.batch_kept && !kept.rejected_reasons.is_empty() {
+            warn!("There are pending rejection reasons, clearing them up: {:?}", kept.rejected_reasons);
+        }
+        if kept.batch_kept && self.finalize_store().is_atomic_in_progress() {
             self.finalize_store().abort_atomic();
         }
     }
@@ -302,8 +319,8 @@ mod tests {
 
         let id_a = vm.allocate_speculation_id();
         let id_b = vm.allocate_speculation_id();
-        vm.store_self_constructed(Vec::new(), IndexMap::new(), id_a, false);
-        vm.store_self_constructed(Vec::new(), IndexMap::new(), id_b, false);
+        vm.store_self_constructed(Vec::new(), IndexMap::new(), Default::default(), id_a, false);
+        vm.store_self_constructed(Vec::new(), IndexMap::new(), Default::default(), id_b, false);
 
         vm.bind_self_constructed_hash(id_a, hash_a);
         assert!(vm.self_constructed_ops_for(hash_a).is_none());
