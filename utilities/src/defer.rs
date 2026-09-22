@@ -22,11 +22,6 @@ impl<F: FnOnce()> Defer<F> {
     pub fn new(f: F) -> Self {
         Defer { f: Some(f) }
     }
-
-    /// Prevents the deferred closure from running on drop.
-    pub fn disarm(mut self) {
-        self.f.take();
-    }
 }
 
 impl<F: FnOnce()> Drop for Defer<F> {
@@ -42,20 +37,4 @@ macro_rules! defer {
     ($($body:tt)*) => {
         let _defer_guard = $crate::Defer::new(|| { $($body)* });
     };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[test]
-    fn disarm_skips_the_deferred_closure() {
-        let ran = AtomicBool::new(false);
-        {
-            let guard = Defer::new(|| ran.store(true, Ordering::SeqCst));
-            guard.disarm();
-        }
-        assert!(!ran.load(Ordering::SeqCst));
-    }
 }
