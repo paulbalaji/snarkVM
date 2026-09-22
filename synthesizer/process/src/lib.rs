@@ -98,7 +98,10 @@ use parking_lot::MutexGuard;
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 // Note: a `Process` and all of its fields are meant to be completely stateless. They have no
@@ -108,6 +111,10 @@ pub struct Process<N: Network> {
     universal_srs: UniversalSRS<N>,
     /// The mapping of program IDs to stacks.
     stacks: Arc<RwLock<IndexMap<ProgramID<N>, Arc<Stack<N>>>>>,
+    /// Stacks accepted by the open speculate. Stack lookup prefers these over `stacks`.
+    staged_stacks: Arc<RwLock<IndexMap<ProgramID<N>, Arc<Stack<N>>>>>,
+    /// `true` while `staged_stacks` is non-empty.
+    staged_stacks_active: Arc<AtomicBool>,
     /// The mapping of program IDs to old stacks.
     old_stacks: RwLock<IndexMap<ProgramID<N>, Option<Arc<Stack<N>>>>>,
     /// A lock used to create instances of `ProcessExclusiveGuard`, which ensures that only
@@ -180,39 +187,58 @@ impl<'a, N: Network> ProcessExclusiveGuard<'a, N> {
         self.process.old_stacks.write().clear();
     }
 
+    /// Records a stack for the open speculate.
+    /// Stack lookup returns it until `take_staged_stacks` or `clear_staged_stacks`.
+    #[inline]
+    pub fn insert_staged_stack(&self, stack: Stack<N>) {
+        let program_id = *stack.program_id();
+        let stack = Arc::new(stack);
+        self.process.staged_stacks.write().insert(program_id, stack);
+        self.process.staged_stacks_active.store(true, Ordering::Release);
+    }
+
+    /// Removes the speculate stacks and returns them.
+    /// Stack lookup uses the committed map afterward.
+    #[inline]
+    pub fn take_staged_stacks(&self) -> IndexMap<ProgramID<N>, Arc<Stack<N>>> {
+        self.process.staged_stacks_active.store(false, Ordering::Release);
+        std::mem::take(&mut *self.process.staged_stacks.write())
+    }
+
+    /// Drops the speculate stacks.
+    /// Stack lookup uses the committed map afterward.
+    #[inline]
+    pub fn clear_staged_stacks(&self) {
+        self.process.staged_stacks_active.store(false, Ordering::Release);
+        self.process.staged_stacks.write().clear();
+    }
+
+    /// Inserts the given stacks into the committed program map.
+    /// An existing stack for the same program ID is replaced.
+    #[inline]
+    pub fn commit_staged_stacks(&self, staged: IndexMap<ProgramID<N>, Arc<Stack<N>>>) {
+        if staged.is_empty() {
+            return;
+        }
+        let mut stacks = self.process.stacks.write();
+        for (program_id, stack) in staged {
+            stacks.insert(program_id, stack);
+        }
+    }
+
     /// Reverts the staged stacks, restoring the previous state of the process.
     /// This will remove the new stacks and restore the old stacks.
     #[inline]
     pub fn revert_stacks(&self) {
-        let _ = self.park_staged_stacks();
-    }
-
-    /// Reverts staged stacks and returns the new stacks so they can be restored later.
-    #[inline]
-    pub fn park_staged_stacks(&self) -> IndexMap<ProgramID<N>, Arc<Stack<N>>> {
         let mut stacks = self.process.stacks.write();
-        let mut parked = IndexMap::with_capacity(self.process.old_stacks.read().len());
-        for (program_id, old) in self.process.old_stacks.write().drain(..) {
-            let new_stack = match old {
-                Some(old) => stacks.insert(program_id, old),
-                None => stacks.shift_remove(&program_id),
-            };
-            if let Some(new_stack) = new_stack {
-                parked.insert(program_id, new_stack);
-            }
-        }
-        parked
-    }
-
-    /// Restages previously parked stacks without committing them.
-    #[inline]
-    pub fn restore_staged_stacks(&self, parked: IndexMap<ProgramID<N>, Arc<Stack<N>>>) {
-        let mut stacks = self.process.stacks.write();
-        let mut old_stacks = self.process.old_stacks.write();
-        for (program_id, new_stack) in parked {
-            let old = stacks.insert(program_id, new_stack);
-            if !old_stacks.contains_key(&program_id) {
-                old_stacks.insert(program_id, old);
+        for (program_id, old_stack) in self.process.old_stacks.write().drain(..) {
+            match old_stack {
+                Some(old_stack) => {
+                    stacks.insert(program_id, old_stack);
+                }
+                None => {
+                    stacks.shift_remove(&program_id);
+                }
             }
         }
     }
@@ -324,6 +350,8 @@ impl<N: Network> Process<N> {
         let process = Self {
             universal_srs: UniversalSRS::load()?,
             stacks: Default::default(),
+            staged_stacks: Default::default(),
+            staged_stacks_active: Default::default(),
             old_stacks: Default::default(),
             lock: Default::default(),
         };
@@ -407,6 +435,8 @@ impl<N: Network> Process<N> {
         let process = Self {
             universal_srs: UniversalSRS::load()?,
             stacks: Default::default(),
+            staged_stacks: Default::default(),
+            staged_stacks_active: Default::default(),
             old_stacks: Default::default(),
             lock: Default::default(),
         };
@@ -457,6 +487,8 @@ impl<N: Network> Process<N> {
         let process = Self {
             universal_srs: UniversalSRS::load()?,
             stacks: Default::default(),
+            staged_stacks: Default::default(),
+            staged_stacks_active: Default::default(),
             old_stacks: Default::default(),
             lock: Default::default(),
         };
@@ -500,6 +532,8 @@ impl<N: Network> Process<N> {
         let process = Self {
             universal_srs: UniversalSRS::load()?,
             stacks: Default::default(),
+            staged_stacks: Default::default(),
+            staged_stacks_active: Default::default(),
             old_stacks: Default::default(),
             lock: Default::default(),
         };
@@ -526,13 +560,24 @@ impl<N: Network> Process<N> {
     /// Returns `true` if the process contains the program with the given ID.
     #[inline]
     pub fn contains_program(&self, program_id: &ProgramID<N>) -> bool {
+        if self.staged_stacks_active.load(Ordering::Acquire) && self.staged_stacks.read().contains_key(program_id) {
+            return true;
+        }
         self.stacks.read().contains_key(program_id)
     }
 
     /// Returns the program IDs of all programs in the process.
     #[inline]
     pub fn program_ids(&self) -> Vec<ProgramID<N>> {
-        self.stacks.read().keys().copied().collect()
+        let mut ids = self.stacks.read().keys().copied().collect::<Vec<_>>();
+        if self.staged_stacks_active.load(Ordering::Acquire) {
+            for program_id in self.staged_stacks.read().keys() {
+                if !ids.contains(program_id) {
+                    ids.push(*program_id);
+                }
+            }
+        }
+        ids
     }
 
     /// Returns the stack for the given program ID.
@@ -540,13 +585,22 @@ impl<N: Network> Process<N> {
     pub fn get_stack(&self, program_id: impl TryInto<ProgramID<N>>) -> Result<Arc<Stack<N>>> {
         // Prepare the program ID.
         let program_id = program_id.try_into().map_err(|_| anyhow!("Invalid program ID"))?;
+        // Speculate stacks shadow the committed map for the duration of the open speculate.
+        let staged = if self.staged_stacks_active.load(Ordering::Acquire) {
+            self.staged_stacks.read().get(&program_id).cloned()
+        } else {
+            None
+        };
         // Retrieve the stack.
-        let stack = self
-            .stacks
-            .read()
-            .get(&program_id)
-            .ok_or_else(|| anyhow!("Program '{program_id}' does not exist"))?
-            .clone();
+        let stack = match staged {
+            Some(stack) => stack,
+            None => self
+                .stacks
+                .read()
+                .get(&program_id)
+                .ok_or_else(|| anyhow!("Program '{program_id}' does not exist"))?
+                .clone(),
+        };
         // Ensure the program ID matches.
         ensure!(stack.program_id() == &program_id, "Expected program '{}', found '{program_id}'", stack.program_id());
         // Return the stack.

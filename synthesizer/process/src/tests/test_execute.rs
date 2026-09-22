@@ -2699,6 +2699,8 @@ fn test_process_deploy_credits_program() {
     let empty_process = Process {
         universal_srs: UniversalSRS::<CurrentNetwork>::load().unwrap(),
         stacks: Default::default(),
+        staged_stacks: Default::default(),
+        staged_stacks_active: Default::default(),
         old_stacks: Default::default(),
         lock: Default::default(),
     };
@@ -2984,4 +2986,67 @@ fn test_program_exceeding_transaction_spend_limit() {
     let deployment = process.deploy::<CurrentAleo, _>(&program, rng).unwrap();
     // Attempt to verify the deployment, which should fail.
     assert!(process.verify_deployment::<CurrentAleo, _>(ConsensusVersion::V8, &deployment, rng).is_ok());
+}
+
+#[test]
+fn test_staged_stacks_commit_separately_from_lookup() {
+    let process = Process::<CurrentNetwork>::load().unwrap();
+    let process = process.lock();
+
+    let foo = Program::<CurrentNetwork>::from_str(
+        r"
+program staged_foo.aleo;
+
+function c:
+    input r0 as u8.private;
+    input r1 as u8.private;
+    add r0 r1 into r2;
+    output r2 as u8.private;
+        ",
+    )
+    .unwrap();
+    let bar = Program::<CurrentNetwork>::from_str(
+        r"
+import staged_foo.aleo;
+
+program staged_bar.aleo;
+
+function b:
+    input r0 as u8.private;
+    input r1 as u8.private;
+    call staged_foo.aleo/c r0 r1 into r2;
+    output r2 as u8.private;
+        ",
+    )
+    .unwrap();
+
+    let foo_id = *foo.id();
+    process.insert_staged_stack(crate::Stack::new(&process, &foo).unwrap());
+
+    // Process lookup sees the speculate stack. A caller cannot resolve it until commit.
+    assert!(process.contains_program(&foo_id));
+    assert!(process.program_ids().contains(&foo_id));
+    assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 0);
+    assert!(crate::Stack::new(&process, &bar).is_err());
+
+    let staged = process.take_staged_stacks();
+    assert!(!process.contains_program(&foo_id));
+    assert!(!process.program_ids().contains(&foo_id));
+    assert!(process.get_stack(foo_id).is_err());
+    assert!(crate::Stack::new(&process, &bar).is_err());
+
+    process.commit_staged_stacks(staged);
+    assert!(process.contains_program(&foo_id));
+    assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 0);
+    crate::Stack::new(&process, &bar).unwrap();
+
+    // A replacement stays on the speculate map until commit.
+    let replacement = crate::Stack::new(&process, &foo).unwrap();
+    assert_eq!(*replacement.program_edition(), 1);
+    process.insert_staged_stack(replacement);
+    assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 1);
+    let staged = process.take_staged_stacks();
+    assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 0);
+    process.commit_staged_stacks(staged);
+    assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 1);
 }

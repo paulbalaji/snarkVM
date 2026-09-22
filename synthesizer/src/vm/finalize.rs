@@ -651,7 +651,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             bail!("Cannot start an atomic batch write operation while another one is already in progress.");
         }
         self.finalize_store().start_atomic();
-        let parked_cell: RefCell<Option<IndexMap<ProgramID<N>, Arc<Stack<N>>>>> = RefCell::new(None);
+        let staged_cell: RefCell<Option<IndexMap<ProgramID<N>, Arc<Stack<N>>>>> = RefCell::new(None);
         let rejected_reasons: RefCell<HashMap<N::TransactionID, RejectedReason<N>>> = RefCell::new(HashMap::new());
         let result = (|| -> Result<_, String> {
             // Ensure the number of solutions does not exceed the maximum.
@@ -701,11 +701,10 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             // we choose to acquire it for the entire duration of this atomic batch.
             let process = self.process.lock();
 
-            // Revert any unstaged stacks, when the function returns.
-            // When `keep` is set, staged stacks are parked instead so they can be restored on commit.
+            // Drop speculate stacks that are not kept for commit.
             defer! {
-                if parked_cell.borrow().is_none() {
-                    process.revert_stacks();
+                if staged_cell.borrow().is_none() {
+                    process.clear_staged_stacks();
                 }
             }
 
@@ -833,8 +832,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                             false => match process.finalize_deployment(state, store, deployment, fee) {
                                 // Construct the accepted deploy transaction.
                                 Ok((stack, finalize)) => {
-                                    // Add the stack to the process with the option to be reverted.
-                                    process.stage_stack(stack);
+                                    // Keep the stack visible to later transactions in this speculate.
+                                    process.insert_staged_stack(stack);
                                     ConfirmedTransaction::accepted_deploy(counter, transaction.clone(), finalize)
                                         .map_err(|e| e.to_string())
                                 }
@@ -1027,7 +1026,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             finish!(timer);
 
             if keep.is_some() {
-                parked_cell.replace(Some(process.park_staged_stacks()));
+                staged_cell.replace(Some(process.take_staged_stacks()));
             }
 
             // Return the ratifications, confirmed & aborted transactions, and finalize operations.
@@ -1035,12 +1034,12 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         })();
         match result {
             Ok((ratifications, confirmed, aborted, ratified_finalize_operations)) => {
-                let parked = parked_cell.into_inner().unwrap_or_default();
+                let staged = staged_cell.into_inner().unwrap_or_default();
                 let rejected_reasons = rejected_reasons.into_inner();
                 if let Some(id) = keep {
                     self.store_self_constructed(
                         ratified_finalize_operations.clone(),
-                        parked,
+                        staged,
                         rejected_reasons,
                         id,
                         true,

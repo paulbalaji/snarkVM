@@ -673,8 +673,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                     guard.disarm();
                 }
                 let process = self.process.lock();
-                process.restore_staged_stacks(kept.parked_stacks);
-                process.commit_stacks();
+                process.commit_staged_stacks(kept.staged_stacks);
                 Ok::<_, anyhow::Error>(())
             })();
             finish.map(|_| Vec::new())

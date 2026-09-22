@@ -39,8 +39,8 @@ pub(crate) struct SelfConstructed<N: Network> {
     pub hash: Option<N::BlockHash>,
     /// Finalize operations from the construct-path speculate, used by `Block::verify`.
     pub finalize_operations: Vec<FinalizeOperation<N>>,
-    /// Staged stacks parked off `Process` so the mempool does not observe uncommitted programs.
-    pub parked_stacks: IndexMap<ProgramID<N>, Arc<Stack<N>>>,
+    /// Deployment stacks from this speculate. Inserted into `Process` when the block is committed.
+    pub staged_stacks: IndexMap<ProgramID<N>, Arc<Stack<N>>>,
     /// Rejection reasons recorded by this speculate. RealRun inserts any that are still pending.
     pub rejected_reasons: HashMap<N::TransactionID, RejectedReason<N>>,
     /// When `true`, the finalize-store atomic batch is still open and must be finished or aborted.
@@ -170,13 +170,13 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
     pub(crate) fn store_self_constructed(
         &self,
         finalize_operations: Vec<FinalizeOperation<N>>,
-        parked_stacks: IndexMap<ProgramID<N>, Arc<Stack<N>>>,
+        staged_stacks: IndexMap<ProgramID<N>, Arc<Stack<N>>>,
         rejected_reasons: HashMap<N::TransactionID, RejectedReason<N>>,
         id: SpeculationId,
         batch_kept: bool,
     ) {
         *self.self_constructed.lock() =
-            Some(SelfConstructed { id, hash: None, finalize_operations, parked_stacks, rejected_reasons, batch_kept });
+            Some(SelfConstructed { id, hash: None, finalize_operations, staged_stacks, rejected_reasons, batch_kept });
     }
 
     /// Removes rejection reasons from the current speculate entry, leaving the rest in place.
