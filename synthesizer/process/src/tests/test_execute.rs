@@ -35,6 +35,7 @@ use snarkvm_synthesizer_program::{FinalizeGlobalState, FinalizeStoreTrait, Progr
 use snarkvm_synthesizer_snark::UniversalSRS;
 
 use aleo_std::StorageMode;
+use indexmap::IndexMap;
 #[cfg(feature = "locktick")]
 use locktick::parking_lot::RwLock;
 #[cfg(not(feature = "locktick"))]
@@ -2699,8 +2700,6 @@ fn test_process_deploy_credits_program() {
     let empty_process = Process {
         universal_srs: UniversalSRS::<CurrentNetwork>::load().unwrap(),
         stacks: Default::default(),
-        staged_stacks: Default::default(),
-        staged_stacks_active: Default::default(),
         old_stacks: Default::default(),
         lock: Default::default(),
     };
@@ -2989,7 +2988,7 @@ fn test_program_exceeding_transaction_spend_limit() {
 }
 
 #[test]
-fn test_staged_stacks_commit_separately_from_lookup() {
+fn test_commit_staged_stacks_inserts_into_process() {
     let process = Process::<CurrentNetwork>::load().unwrap();
     let process = process.lock();
 
@@ -3021,15 +3020,9 @@ function b:
     .unwrap();
 
     let foo_id = *foo.id();
-    process.insert_staged_stack(crate::Stack::new(&process, &foo).unwrap());
+    let mut staged = IndexMap::new();
+    staged.insert(foo_id, Arc::new(crate::Stack::new(&process, &foo).unwrap()));
 
-    // Process lookup sees the speculate stack. A caller cannot resolve it until commit.
-    assert!(process.contains_program(&foo_id));
-    assert!(process.program_ids().contains(&foo_id));
-    assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 0);
-    assert!(crate::Stack::new(&process, &bar).is_err());
-
-    let staged = process.take_staged_stacks();
     assert!(!process.contains_program(&foo_id));
     assert!(!process.program_ids().contains(&foo_id));
     assert!(process.get_stack(foo_id).is_err());
@@ -3037,16 +3030,15 @@ function b:
 
     process.commit_staged_stacks(staged);
     assert!(process.contains_program(&foo_id));
+    assert!(process.program_ids().contains(&foo_id));
     assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 0);
     crate::Stack::new(&process, &bar).unwrap();
 
-    // A replacement stays on the speculate map until commit.
     let replacement = crate::Stack::new(&process, &foo).unwrap();
     assert_eq!(*replacement.program_edition(), 1);
-    process.insert_staged_stack(replacement);
-    assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 1);
-    let staged = process.take_staged_stacks();
     assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 0);
+    let mut staged = IndexMap::new();
+    staged.insert(foo_id, Arc::new(replacement));
     process.commit_staged_stacks(staged);
     assert_eq!(*process.get_stack(foo_id).unwrap().program_edition(), 1);
 }

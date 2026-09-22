@@ -701,12 +701,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             // we choose to acquire it for the entire duration of this atomic batch.
             let process = self.process.lock();
 
-            // Drop speculate stacks that are not kept for commit.
-            defer! {
-                if staged_cell.borrow().is_none() {
-                    process.clear_staged_stacks();
-                }
-            }
+            // Deployment stacks retained for a kept speculate. Not inserted into `Process` here.
+            let mut staged_stacks = IndexMap::new();
 
             // Initialize a list of the confirmed transactions.
             let mut confirmed = Vec::with_capacity(num_transactions);
@@ -832,8 +828,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                             false => match process.finalize_deployment(state, store, deployment, fee) {
                                 // Construct the accepted deploy transaction.
                                 Ok((stack, finalize)) => {
-                                    // Keep the stack visible to later transactions in this speculate.
-                                    process.insert_staged_stack(stack);
+                                    staged_stacks.insert(*stack.program_id(), Arc::new(stack));
                                     ConfirmedTransaction::accepted_deploy(counter, transaction.clone(), finalize)
                                         .map_err(|e| e.to_string())
                                 }
@@ -1026,7 +1021,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             finish!(timer);
 
             if keep.is_some() {
-                staged_cell.replace(Some(process.take_staged_stacks()));
+                staged_cell.replace(Some(staged_stacks));
             }
 
             // Return the ratifications, confirmed & aborted transactions, and finalize operations.
